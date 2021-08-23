@@ -4,11 +4,13 @@ An AbstractGenerator and ReportGenerator implementation to generate a markdown r
 This class can generate its CLI parser, load args, generate a ResultsAggregator object, and format the output data as a md report. 
 """
 
-import os, sys, json, argparse
+import os, sys, json, argparse, itertools, db_utils
 from github import Github, UnknownObjectException
 from generators import AbstractGenerator,ReportGenerator
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from datamodel import ResultsAggregator as ra
+from random import randrange
+from datetime import datetime
 
 class GitHubIssueGenerator(AbstractGenerator.AbstractGenerator, ReportGenerator.ReportGenerator):
 
@@ -60,7 +62,8 @@ class GitHubIssueGenerator(AbstractGenerator.AbstractGenerator, ReportGenerator.
         hub_platform=None, import_cluster_details=[], job_url=None, build_id=None,
         sd_url=None, md_url=None, must_gather_url=None, results_url=None, ignorelist=[], assigneelist={},
         passing_quality_gate=100, executed_quality_gate=100, github_token=os.getenv('GITHUB_TOKEN'), github_org=["open-cluster-management"],
-        github_repo=["cicd-staging"], tags=[], dry_run=True, output_file="github.md"):
+        github_repo=["cicd-staging"], tags=[], dry_run=True, output_file="github.md",
+        consolidated_defect=True, persquad_defect=False):
         """Create a GitHubIssueGenerator Object, unroll xml files from input, and initialize a ResultsAggregator.  
 
         Required Arguments:
@@ -87,8 +90,10 @@ class GitHubIssueGenerator(AbstractGenerator.AbstractGenerator, ReportGenerator.
         github_org      --  the github organization where the git issue should be created
         github_repo     --  the github repo where the git issue should be created
         tags    --  a list of github tags that should be applied to the git issue
-        dry_run --  toggles actual github creation - if present an issue will not actually be created, but we'll run through the paces
+        dry_run --  toggles actual github creation - if present issues will not actually be created, but we'll run through the paces
         output_file --  a place to output the git issue's raw markdown, especially useful when using dry-run
+        consolidated_defect --  original, consolidated defect creation in github when dry_run is not on
+        persquad_defect --  create issues only if a unique set of failures appears by squad (and dry_run is not on) - requires database connection
         """
         self.snapshot = snapshot
         self.branch = branch
@@ -113,6 +118,8 @@ class GitHubIssueGenerator(AbstractGenerator.AbstractGenerator, ReportGenerator.
         self.tags = tags
         self.dry_run = dry_run
         self.output_file = output_file
+        self.consolidated_defect = consolidated_defect
+        self.persquad_defect = persquad_defect
         for _results_dir in results_dirs:
             _files_list = os.listdir(_results_dir)
             for _f in _files_list:
@@ -166,11 +173,24 @@ Example Usages:
         gh_parser.add_argument('-o', '--output-file',
             help="If provided - GitHub issue contents will be mirrored to the input filename.")
         gh_parser.add_argument('-dr', '--dry-run', action='store_true',
-            help="If provided - an actual GitHub issue will not be created, but the file will be generated, best used with -o.")
+            help="If provided - actual GitHub issue(s) will not be created, but the file will be generated, best used with -o.")
+        consolidated_defect_parser = gh_parser.add_mutually_exclusive_group(required=False)
+        consolidated_defect_parser.add_argument('-cd', '--consolidated-defect', dest='consolidated_defect', action='store_true',
+            help="If provided - create the original, consolidated defect (assuming --dry-run is not set). Defaults to set.")
+        consolidated_defect_parser.add_argument('-nocd', '--no-consolidated-defect', dest='consolidated_defect', action='store_false',
+            help="If provided - do not create the original, consolidated defect.")
+        gh_parser.set_defaults(consolidated_defect_parser=True)
+        persquad_parser = gh_parser.add_mutually_exclusive_group(required=False)
+        persquad_parser.add_argument('-psd', '--per-squad-defect', dest='persquad_defect', action='store_true',
+            help="If provided - create defects on a per-squad basis (assuming --dry-run is not set). Defaults to not set.")
+        persquad_parser.add_argument('-nopsd', '--no-per-squad-defect', dest='persquad_defect', action='store_false',
+            help="If provided - do not create defects on a per-squad basis. Defaults to set.")
+        gh_parser.set_defaults(persquad_parser=False)
+
         gh_parser.add_argument('-t', '--tags', action='append', default=[],
             help="GitHub issue tags to apply to the created issue.  Only applied if the tags exist on the target repository.")
         gh_parser.add_argument('-al', '--assignee-list',
-            help="GitHub issue assignee for the created issue.  Only applied if the assignees exist on the target repository.")
+            help="GitHub issue assignee for the created issue(s).  Only applied if the assignees exist on the target repository.")
         gh_parser.set_defaults(func=GitHubIssueGenerator.generate_github_issue_from_args)
         return subparser_name, gh_parser
 
@@ -215,18 +235,122 @@ Example Usages:
             import_cluster_details=_import_cluster_details, job_url=args.job_url, build_id=args.build_id, ignorelist=_ignorelist, assigneelist=_assigneelist,
             sd_url=args.snapshot_diff_url, md_url=args.markdown_url, executed_quality_gate=int(args.executed_quality_gate), passing_quality_gate=int(args.passing_quality_gate),
             results_url=args.results_url, must_gather_url=args.must_gather_url, github_token=args.github_token, github_org=args.github_organization,
-            github_repo=args.repo, tags=args.tags, dry_run=args.dry_run, output_file=args.output_file)
+            github_repo=args.repo, tags=args.tags, dry_run=args.dry_run, output_file=args.output_file,
+            consolidated_defect=args.consolidated_defect, persquad_defect=args.persquad_defect)
         _message = _generator.open_github_issue()
+        _generator.open_github_issues()
 
     
+    def open_github_issues(self):
+        # Connect to our duplicate detection database
+        db_utils.connect_to_db()
+
+        # Get all results of this canary test
+        _results = self.aggregated_results.get_results()
+        # Get just the failed tests
+        _failures = list(filter(lambda a: a['state'] == "failed", _results))
+        # Get a view of just the metadata to extract the list of squads
+        _metadata = []
+        for f in _failures:
+            _metadata.append(f['metadata'])
+        # What are the unique squads in that metadata?
+        _squads = list(set(itertools.chain(*map(lambda r: r.get('squad(s)', "Unlabelled"), _metadata))))
+        # Iterate over all squads and open an issue for that squad if one doesn't already exist for this set of failures
+        for squad in _squads:
+            _squad_issue_set = list(filter(lambda a: a['metadata']['squad(s)'][0] == squad, _failures))
+            # Need to flatten issue set down to name, testsuite, squad, pri, sev
+            _flat_issue_set = []
+            _highest_sev=len(GitHubIssueGenerator.tag_mappings)
+            _highest_pri=len(GitHubIssueGenerator.tag_mappings)
+            for issue in _squad_issue_set:
+                new_issue = {"name":issue['name'],"testsuite":issue['testsuite']}
+                sev = GitHubIssueGenerator.tag_mappings.get(issue['metadata']['severity'].lower(), None)
+                pri = GitHubIssueGenerator.tag_mappings.get(issue['metadata']['priority'].lower(), None)
+                _highest_sev = GitHubIssueGenerator.severities.index(sev) if sev in GitHubIssueGenerator.severities and GitHubIssueGenerator.severities.index(sev) < _highest_sev else _highest_sev
+                _highest_pri = GitHubIssueGenerator.priorities.index(pri) if pri in GitHubIssueGenerator.priorities and GitHubIssueGenerator.priorities.index(pri) < _highest_pri else _highest_pri
+                _flat_issue_set.append(new_issue)
+            if _highest_sev == len(GitHubIssueGenerator.tag_mappings):
+                # A severity wasn't found, for some reason - assign highest
+                _highest_sev = 0
+            if _highest_pri == len(GitHubIssueGenerator.tag_mappings):
+                # A priority wasn't found, for some reason - assign highest
+                _highest_pri = 1 # 0 would be blocker, that's a little aggressive
+            if len(_flat_issue_set) > 0:
+                # Iterate through db, see if issue exists already
+                _sh = "Unknown" if self.snapshot == None else self.snapshot
+                dup = db_utils.payload_exists(_flat_issue_set, _sh)
+                if dup == None:
+                    # Get a local copy of tags they want us to add
+                    _tags = self.tags.copy()
+                    _tags.append(GitHubIssueGenerator.severities[_highest_sev])
+                    _tags.append(GitHubIssueGenerator.priorities[_highest_pri])
+                    _tags.append("squad:{}".format(squad))
+                    github_id = self.open_github_issue_per_squad(_tags, squad)
+                    if github_id == None:
+                        github_id = "seed{}".format(randrange(100000,999999))
+                    print(f"Unique issue, adding github id {github_id} severity '{GitHubIssueGenerator.severities[_highest_sev]}' and priority '{GitHubIssueGenerator.priorities[_highest_pri]}' for squad:{squad}.", file=sys.stderr, flush=False)
+                    # Needed because "Object of type datetime is not JSON serializable"
+                    _now = "{}".format(datetime.utcnow())
+                    _hv = "Unknown" if self.hub_version == None else self.hub_version
+                    _hp = "Unknown" if self.hub_platform == None else self.hub_platform
+                    entry = {"github_id":github_id, "first_snapshot":_sh, "hub_version":_hv, "hub_platform":_hp, "import_cluster_details":self.import_cluster_details, "status":"open","severity":GitHubIssueGenerator.severities[_highest_sev],"priority":GitHubIssueGenerator.priorities[_highest_pri],"date":_now,"squad_tag":"squad:{}".format(squad),"payload":_flat_issue_set}
+                    print(f"Return code from database insert: {db_utils.insert_canary_issue(entry)}", file=sys.stderr, flush=False)
+                else:
+                    print(f"squad:{squad} is a duplicate of issue {dup}.", file=sys.stderr, flush=False)
+        db_utils.disconnect_from_db()
+
+    def open_github_issue_per_squad(self, _tags, squad):
+        """Macro function to assemble and open GitHub Issues, one per squad.  This wraps the title, body, and tag assembly and issue generation."""
+        _message = self.generate_github_issue_body()
+        _github_tags_objects = []
+        _assignees=[]
+        if self.persquad_defect and not self.dry_run:
+            try:
+                g = Github(self.github_token)
+                org = g.get_organization(self.github_org[0])
+                repo = org.get_repo(self.github_repo[0])
+            except UnknownObjectException as ex:
+                print(f"Failed login to GitHub or find org/repo.  See error below for additional details: {ex}", file=sys.stderr, flush=False)
+                exit(1)
+            print(f"Using github org {self.github_org[0]}, repo {self.github_repo[0]}", file=sys.stderr, flush=False)
+            for tag in _tags:
+                try:
+                    _github_tags_objects.append(repo.get_label(tag))
+                except UnknownObjectException as ex:
+                    print(f"Couldn't find GitHub Tag {tag}, skipping and continuing.", file=sys.stderr, flush=False)
+                    pass
+            for tag in _tags:
+                try:
+                    if "squad:{}".format(tag) in self.assigneelist:
+                        _assignees.append(GitHubIssueGenerator.get_user(org, self.assigneelist[tag]))
+                except UnknownObjectException as ex:
+                    print(f"No user for {tag}, skipping and continuing.", file=sys.stderr, flush=False)
+                    pass
+            _issue_title = "{}:{}".format(self.generate_issue_title(),squad)
+            _issue = repo.create_issue(_issue_title, body=_message, labels=_github_tags_objects, assignees=_assignees)
+            print(_issue.html_url)
+            return _issue.number
+        else:
+            print(f"--dry-run or --no-per-squad-defect has been set, skipping squad's git issue creation", file=sys.stderr, flush=False)
+            print(f"GitHub issue would've been created on github.com/{self.github_org[0]}/{self.github_repo[0]}.", file=sys.stderr, flush=False)
+            if len(_tags) > 0:
+                print(f"We would attempt to apply the following tags:", file=sys.stderr, flush=False)
+                for tag in _tags:
+                    print(f"* {tag}", file=sys.stderr, flush=False)
+                print(f"We would attempt to assign the following user:", file=sys.stderr, flush=False)
+                for tag in _tags:
+                    if tag in self.assigneelist:
+                        print(f"* {self.assigneelist[tag]}", file=sys.stderr, flush=False)
+
     def open_github_issue(self):
         """Macro function to assemble and open our GitHub Issue.  This wraps the title, body, and tag assembly and issue generation."""
         _message = self.generate_github_issue_body()
+
         _tags = self.generate_tags()
         if self.output_file is not None:
             with open(self.output_file, "w+") as f:
                 f.write(_message)
-        if not self.dry_run:
+        if self.consolidated_defect and not self.dry_run:
             try:
                 g = Github(self.github_token)
                 org = g.get_organization(self.github_org[0])
@@ -252,16 +376,16 @@ Example Usages:
             _issue = repo.create_issue(self.generate_issue_title(), body=_message, labels=_github_tags_objects, assignees=_assignees)
             print(_issue.html_url)
         else:
-            print("--dry-run as been set, skipping git issue creation")
-            print(f"GitHub issue would've been created on github.com/{self.github_org[0]}/{self.github_repo[0]}.")
+            print(f"--dry-run or --no-consolidated-defect has been set, skipping consolidated git issue creation", file=sys.stderr, flush=False)
+            print(f"GitHub issue would've been created on github.com/{self.github_org[0]}/{self.github_repo[0]}.", file=sys.stderr, flush=False)
             if len(_tags) > 0:
-                print("We would attempt to apply the following tags:")
+                print(f"We would attempt to apply the following tags:", file=sys.stderr, flush=False)
                 for tag in _tags:
-                    print(f"* {tag}")
-                print("We would attempt to assign the following user:")
+                    print(f"* {tag}", file=sys.stderr, flush=False)
+                print(f"We would attempt to assign the following user:", file=sys.stderr, flush=False)
                 for tag in _tags:
                     if tag in self.assigneelist:
-                        print(f"* {self.assigneelist[tag]}")
+                        print(f"* {self.assigneelist[tag]}", file=sys.stderr, flush=False)
 
 
     def generate_tags(self):
@@ -269,8 +393,10 @@ Example Usages:
         _unique_tags = [t if GitHubIssueGenerator.tag_mappings.get(t.lower(), None) is None else GitHubIssueGenerator.tag_mappings.get(t.lower(), None) for t in _unique_tags]
         _tags = list(set([*_unique_tags, *self.tags])) # Merge and find unique detected tags and user-input tags
         # Translate tag shortnames into GitHub tag values using our mappings
-        _tags = self.filter_ordered_tags(_tags, GitHubIssueGenerator.severities)
-        _tags = self.filter_ordered_tags(_tags, GitHubIssueGenerator.priorities)
+        _mutable_sevs = GitHubIssueGenerator.severities.copy()
+        _mutable_pris = GitHubIssueGenerator.priorities.copy()
+        _tags = self.filter_ordered_tags(_tags, _mutable_sevs)
+        _tags = self.filter_ordered_tags(_tags, _mutable_pris)
         return _tags
 
     def get_user(org, user_name):
@@ -279,7 +405,7 @@ Example Usages:
                 return user
 
     def filter_ordered_tags(self, target, ordered_filter):
-        """Helper function to filer an input list to include only the highest-indexed entry given an ordered list of priority/severity tags."""
+        """Helper function to filer an input list to include only the filter_ordered_tagshighest-indexed entry given an ordered list of priority/severity tags."""
         _highest=len(ordered_filter)
         for t in target:
             _highest = ordered_filter.index(t) if t in ordered_filter and ordered_filter.index(t) < _highest else _highest
@@ -289,7 +415,7 @@ Example Usages:
             return _filtered_target
         else:
             return target
-    
+
 
     def generate_github_issue_body(self):
         """Macro function to assemble our GitHub Issue.  This wraps the header, metadata, summary, and body generation with a neat bow."""
